@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "budget"
+version = "0.1.0"
+description = "Personal budgeting CLI for household savings and debt optimization"
+requires-python = ">=3.11"
+dependencies = [
+    "click>=8.1",
+    "pydantic>=2.0",
+    "rich>=13.0",
+]
+
+[project.scripts]
+budget = "budget.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/budget"]

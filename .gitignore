@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# Local budget data (lives in ~/.budget by default, but never commit DBs)
+*.db
+*.sqlite
+*.sqlite3
+
+# OS / editor
+.DS_Store
