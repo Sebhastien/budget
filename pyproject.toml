@@ -18,3 +18,11 @@ budget = "budget.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/budget"]
+
+[tool.pytest.ini_options]
+# Make the src-layout package importable during tests without relying on the
+# editable install. (uv marks its editable .pth file UF_HIDDEN, and Python
+# 3.13's site.addpackage skips hidden .pth files, so the editable install is
+# unreliable here. This setting is independent of that.)
+pythonpath = ["src"]
+testpaths = ["tests"]
