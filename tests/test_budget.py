@@ -7,6 +7,9 @@ from datetime import date
 from decimal import Decimal
 from pathlib import Path
 
+from click.testing import CliRunner
+
+from budget.cli import main
 from budget.csv_import import import_csv_file
 from budget.db import (
     find_transaction_by_dedupe_hash,
@@ -243,3 +246,110 @@ def test_debt_projection() -> None:
     proj = debt_payoff_projection(extra_monthly_cents=to_cents("200"))
     assert proj["total_debt_cents"] == 800000
     assert proj["estimated_months_to_payoff"] > 0
+
+
+def test_debt_projection_avalanche_rolls_freed_minimums_and_interest() -> None:
+    _fresh_db()
+    from budget.db import insert_debt_account
+
+    insert_debt_account(DebtAccount(
+        name="High APR Card",
+        original_balance_cents=to_cents("1000"),
+        current_balance_cents=to_cents("1000"),
+        min_payment_cents=to_cents("50"),
+        interest_rate_percent=Decimal("24"),
+    ))
+    insert_debt_account(DebtAccount(
+        name="Low APR Loan",
+        original_balance_cents=to_cents("1000"),
+        current_balance_cents=to_cents("1000"),
+        min_payment_cents=to_cents("50"),
+        interest_rate_percent=Decimal("6"),
+    ))
+
+    proj = debt_payoff_projection(extra_monthly_cents=to_cents("100"), strategy="avalanche")
+
+    assert proj["strategy"] == "avalanche"
+    assert proj["monthly_payment_budget_cents"] == to_cents("200")
+    assert proj["minimum_payment_only"]["estimated_months_to_payoff"] > proj["estimated_months_to_payoff"]
+    assert proj["interest_saved_cents"] > 0
+    assert [item["name"] for item in proj["payoff_order"]][:2] == ["High APR Card", "Low APR Loan"]
+    assert all(item["payoff_month"] for item in proj["payoff_order"])
+    assert proj["total_interest_cents"] > 0
+
+
+def test_debt_projection_snowball_orders_by_balance() -> None:
+    _fresh_db()
+    from budget.db import insert_debt_account
+
+    insert_debt_account(DebtAccount(
+        name="Large High APR Card",
+        original_balance_cents=to_cents("5000"),
+        current_balance_cents=to_cents("5000"),
+        min_payment_cents=to_cents("100"),
+        interest_rate_percent=Decimal("29"),
+    ))
+    insert_debt_account(DebtAccount(
+        name="Small Low APR Loan",
+        original_balance_cents=to_cents("500"),
+        current_balance_cents=to_cents("500"),
+        min_payment_cents=to_cents("25"),
+        interest_rate_percent=Decimal("3"),
+    ))
+
+    proj = debt_payoff_projection(extra_monthly_cents=to_cents("100"), strategy="snowball")
+
+    assert proj["strategy"] == "snowball"
+    assert [item["name"] for item in proj["payoff_order"]][:2] == ["Small Low APR Loan", "Large High APR Card"]
+
+
+def test_debt_cli_add_list_update_and_report(tmp_path: Path) -> None:
+    runner = CliRunner()
+    data_dir = tmp_path / "budget-data"
+
+    init_result = runner.invoke(main, ["--data-dir", str(data_dir), "init"])
+    assert init_result.exit_code == 0
+
+    add_result = runner.invoke(main, [
+        "--data-dir", str(data_dir),
+        "debt", "add",
+        "--name", "Visa",
+        "--balance", "1200",
+        "--min-payment", "40",
+        "--apr", "22.99",
+        "--strategy", "avalanche",
+        "--priority", "2",
+    ])
+    assert add_result.exit_code == 0
+    assert "Added debt: Visa" in add_result.output
+
+    list_result = runner.invoke(main, ["--data-dir", str(data_dir), "debt", "list"])
+    assert list_result.exit_code == 0
+    assert "Visa" in list_result.output
+    assert "$1200.00" in list_result.output
+    assert "22.99%" in list_result.output
+
+    debt_id = runner.invoke(main, ["--data-dir", str(data_dir), "debt", "list", "--json"]).output
+    import json
+    parsed = json.loads(debt_id)
+    visa_id = parsed["debts"][0]["id"]
+
+    update_result = runner.invoke(main, [
+        "--data-dir", str(data_dir),
+        "debt", "update",
+        "--id", visa_id,
+        "--balance", "900",
+        "--min-payment", "35",
+    ])
+    assert update_result.exit_code == 0
+    assert "Updated debt: Visa" in update_result.output
+
+    report_result = runner.invoke(main, [
+        "--data-dir", str(data_dir),
+        "report", "debt",
+        "--extra-monthly", "100",
+        "--strategy", "avalanche",
+    ])
+    assert report_result.exit_code == 0
+    assert "Strategy: avalanche" in report_result.output
+    assert "Debt-free date:" in report_result.output

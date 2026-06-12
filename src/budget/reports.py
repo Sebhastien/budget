@@ -6,6 +6,7 @@ import calendar
 import statistics
 from collections import defaultdict
 from datetime import date, timedelta
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Any
 
 from budget.db import (
@@ -211,20 +212,157 @@ def month_over_month(current_month: date) -> dict[str, Any]:
     }
 
 
-def debt_payoff_projection(extra_monthly_cents: int = 0) -> dict[str, Any]:
+def _add_months(start: date, months: int) -> date:
+    month_index = start.month - 1 + months
+    year = start.year + month_index // 12
+    month = month_index % 12 + 1
+    return date(year, month, 1)
+
+
+def _debt_sort_key(strategy: str):
+    def key(debt: DebtAccount) -> tuple[Any, ...]:
+        apr = debt.interest_rate_percent or Decimal("0")
+        if strategy == "snowball":
+            return (debt.current_balance_cents, -apr, debt.payoff_priority, debt.name)
+        if strategy == "custom":
+            return (debt.payoff_priority, debt.name)
+        # Avalanche: highest APR first, then smaller balance as a tie-breaker.
+        return (-apr, debt.current_balance_cents, debt.payoff_priority, debt.name)
+    return key
+
+
+def _monthly_interest_cents(balance_cents: int, apr: Decimal | None) -> int:
+    if balance_cents <= 0 or apr is None or apr <= 0:
+        return 0
+    interest = (Decimal(balance_cents) * apr / Decimal("100") / Decimal("12"))
+    return int(interest.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+def _simulate_debt_payoff(
+    debts: list[DebtAccount],
+    *,
+    extra_monthly_cents: int,
+    strategy: str,
+    start_month: date,
+    max_months: int = 1200,
+) -> dict[str, Any]:
+    balances = {d.id: d.current_balance_cents for d in debts if d.current_balance_cents > 0}
+    order = sorted([d for d in debts if d.current_balance_cents > 0], key=_debt_sort_key(strategy))
+    min_total = sum(d.min_payment_cents for d in order)
+    monthly_budget = min_total + extra_monthly_cents
+    total_interest = 0
+    payoff_months: dict[str, str] = {}
+    months = 0
+
+    if not balances:
+        return {
+            "estimated_months_to_payoff": 0,
+            "debt_free_date": start_month.isoformat(),
+            "total_interest_cents": 0,
+            "payoff_order": [],
+            "unpayable": False,
+        }
+    if monthly_budget <= 0:
+        return {
+            "estimated_months_to_payoff": None,
+            "debt_free_date": None,
+            "total_interest_cents": 0,
+            "payoff_order": [],
+            "unpayable": True,
+        }
+
+    while balances and months < max_months:
+        months += 1
+
+        # Interest accrues monthly before payments.
+        for debt in order:
+            if debt.id not in balances:
+                continue
+            interest = _monthly_interest_cents(balances[debt.id], debt.interest_rate_percent)
+            balances[debt.id] += interest
+            total_interest += interest
+
+        remaining_budget = monthly_budget
+
+        # Keep every active debt current with its minimum payment first.
+        for debt in order:
+            if debt.id not in balances or remaining_budget <= 0:
+                continue
+            payment = min(debt.min_payment_cents, remaining_budget, balances[debt.id])
+            balances[debt.id] -= payment
+            remaining_budget -= payment
+            if balances.get(debt.id, 0) <= 0:
+                balances.pop(debt.id, None)
+                payoff_months[debt.id] = _add_months(start_month, months).isoformat()
+
+        # Roll freed minimums and extra dollars into the target debt, cascading
+        # within the same month if the payment pays off more than one balance.
+        while remaining_budget > 0 and balances:
+            target = next((debt for debt in order if debt.id in balances), None)
+            if target is None:
+                break
+            payment = min(remaining_budget, balances[target.id])
+            balances[target.id] -= payment
+            remaining_budget -= payment
+            if balances[target.id] <= 0:
+                balances.pop(target.id, None)
+                payoff_months[target.id] = _add_months(start_month, months).isoformat()
+
+    unpayable = bool(balances)
+    payoff_order = []
+    for debt in order:
+        payoff_order.append({
+            "id": debt.id,
+            "name": debt.name,
+            "starting_balance_cents": debt.current_balance_cents,
+            "min_payment_cents": debt.min_payment_cents,
+            "interest_rate_percent": str(debt.interest_rate_percent) if debt.interest_rate_percent is not None else None,
+            "payoff_month": payoff_months.get(debt.id),
+        })
+
+    return {
+        "estimated_months_to_payoff": None if unpayable else months,
+        "debt_free_date": None if unpayable else _add_months(start_month, months).isoformat(),
+        "total_interest_cents": total_interest,
+        "payoff_order": payoff_order,
+        "unpayable": unpayable,
+    }
+
+
+def debt_payoff_projection(extra_monthly_cents: int = 0, strategy: str = "avalanche") -> dict[str, Any]:
+    if strategy not in {"avalanche", "snowball", "custom"}:
+        raise ValueError("strategy must be one of: avalanche, snowball, custom")
+
     debts = list_debt_accounts(active_only=True)
     total = sum(d.current_balance_cents for d in debts)
     min_total = sum(d.min_payment_cents for d in debts)
+    start_month = date.today().replace(day=1)
 
-    # Simple projection: months = balance / (min + extra)
-    months = 0
-    if total > 0 and (min_total + extra_monthly_cents) > 0:
-        months = total // (min_total + extra_monthly_cents)
+    projection = _simulate_debt_payoff(
+        debts,
+        extra_monthly_cents=extra_monthly_cents,
+        strategy=strategy,
+        start_month=start_month,
+    )
+    minimum_only = _simulate_debt_payoff(
+        debts,
+        extra_monthly_cents=0,
+        strategy=strategy,
+        start_month=start_month,
+    )
+    interest_saved = max(0, minimum_only["total_interest_cents"] - projection["total_interest_cents"])
 
     return {
+        "strategy": strategy,
         "total_debt_cents": total,
         "min_payments_cents": min_total,
         "extra_monthly_cents": extra_monthly_cents,
-        "estimated_months_to_payoff": months,
+        "monthly_payment_budget_cents": min_total + extra_monthly_cents,
+        "estimated_months_to_payoff": projection["estimated_months_to_payoff"],
+        "debt_free_date": projection["debt_free_date"],
+        "total_interest_cents": projection["total_interest_cents"],
+        "interest_saved_cents": interest_saved,
+        "payoff_order": projection["payoff_order"],
+        "minimum_payment_only": minimum_only,
         "debts": [d.model_dump(mode="json") for d in debts],
     }
