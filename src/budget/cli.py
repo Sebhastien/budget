@@ -6,8 +6,9 @@ import json
 import os
 import sys
 from datetime import date
+from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 
 import click
 
@@ -500,6 +501,157 @@ def reconcile(month: str, json_mode: bool, dry_run: bool) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Debt accounts
+# ---------------------------------------------------------------------------
+
+@main.group("debt")
+def debt() -> None:
+    """Debt account management."""
+    pass
+
+
+@debt.command("add")
+@click.option("--name", required=True)
+@click.option("--balance", type=str, required=True)
+@click.option("--min-payment", type=str, required=True)
+@click.option("--apr", type=str, default=None, help="Annual percentage rate, e.g. 22.99")
+@click.option("--strategy", type=click.Choice(["avalanche", "snowball", "custom"]), default="avalanche")
+@click.option("--priority", type=int, default=0, help="Custom payoff priority; lower comes first.")
+@click.option("--category-id", default=None)
+@click.option("--notes", default="")
+@click.option("--json", "json_mode", is_flag=True)
+@click.option("--dry-run", is_flag=True)
+def debt_add(
+    name: str,
+    balance: str,
+    min_payment: str,
+    apr: str | None,
+    strategy: str,
+    priority: int,
+    category_id: str | None,
+    notes: str,
+    json_mode: bool,
+    dry_run: bool,
+) -> None:
+    _require_db()
+    from budget.db import insert_debt_account
+    from budget.models import DebtAccount, to_cents
+
+    balance_cents = to_cents(balance)
+    debt_account = DebtAccount(
+        name=name,
+        original_balance_cents=balance_cents,
+        current_balance_cents=balance_cents,
+        min_payment_cents=to_cents(min_payment),
+        interest_rate_percent=Decimal(apr) if apr else None,
+        payoff_strategy=cast(Literal["avalanche", "snowball", "custom"], strategy),
+        payoff_priority=priority,
+        category_id=category_id,
+        notes=notes,
+    )
+    if not dry_run:
+        insert_debt_account(debt_account)
+    rollback_id = None if dry_run else _audit("debt_add", "debt_account", debt_account.id, debt_account.model_dump(mode="json"))
+    payload = {"debt": debt_account.model_dump(mode="json"), "rollback_id": rollback_id}
+    if json_mode:
+        _out_json(payload)
+    else:
+        click.echo(f"Added debt: {name}")
+        click.echo(f"Rollback ID: {rollback_id}")
+
+
+@debt.command("list")
+@click.option("--json", "json_mode", is_flag=True)
+@click.option("--all", "show_all", is_flag=True, help="Include inactive debts.")
+def debt_list(json_mode: bool, show_all: bool) -> None:
+    _require_db()
+    from budget.db import list_debt_accounts
+
+    debts = list_debt_accounts(active_only=not show_all)
+    if json_mode:
+        _out_json({"debts": [d.model_dump(mode="json") for d in debts]})
+    else:
+        click.echo(f"Debt accounts: {len(debts)}")
+        for d in debts:
+            apr = f"{d.interest_rate_percent}%" if d.interest_rate_percent is not None else "n/a"
+            status = "active" if d.active else "inactive"
+            click.echo(
+                f"  {d.id} | {d.name} | ${d.current_balance_cents/100:.2f} | "
+                f"min ${d.min_payment_cents/100:.2f} | {apr} | {d.payoff_strategy} | {status}"
+            )
+
+
+@debt.command("update")
+@click.option("--id", "debt_id", required=True)
+@click.option("--name", default=None)
+@click.option("--balance", type=str, default=None)
+@click.option("--original-balance", type=str, default=None)
+@click.option("--min-payment", type=str, default=None)
+@click.option("--apr", type=str, default=None)
+@click.option("--strategy", type=click.Choice(["avalanche", "snowball", "custom"]), default=None)
+@click.option("--priority", type=int, default=None)
+@click.option("--category-id", default=None)
+@click.option("--notes", default=None)
+@click.option("--active/--inactive", default=None)
+@click.option("--json", "json_mode", is_flag=True)
+@click.option("--dry-run", is_flag=True)
+def debt_update(
+    debt_id: str,
+    name: str | None,
+    balance: str | None,
+    original_balance: str | None,
+    min_payment: str | None,
+    apr: str | None,
+    strategy: str | None,
+    priority: int | None,
+    category_id: str | None,
+    notes: str | None,
+    active: bool | None,
+    json_mode: bool,
+    dry_run: bool,
+) -> None:
+    _require_db()
+    from budget.db import get_debt_account_by_id, update_debt_account
+    from budget.models import to_cents
+
+    debt_account = get_debt_account_by_id(debt_id)
+    if debt_account is None:
+        click.echo("Debt account not found.", err=True)
+        sys.exit(1)
+
+    if name is not None:
+        debt_account.name = name
+    if balance is not None:
+        debt_account.current_balance_cents = to_cents(balance)
+    if original_balance is not None:
+        debt_account.original_balance_cents = to_cents(original_balance)
+    if min_payment is not None:
+        debt_account.min_payment_cents = to_cents(min_payment)
+    if apr is not None:
+        debt_account.interest_rate_percent = Decimal(apr)
+    if strategy is not None:
+        debt_account.payoff_strategy = cast(Literal["avalanche", "snowball", "custom"], strategy)
+    if priority is not None:
+        debt_account.payoff_priority = priority
+    if category_id is not None:
+        debt_account.category_id = category_id
+    if notes is not None:
+        debt_account.notes = notes
+    if active is not None:
+        debt_account.active = active
+
+    if not dry_run:
+        update_debt_account(debt_account)
+    rollback_id = None if dry_run else _audit("debt_update", "debt_account", debt_account.id, debt_account.model_dump(mode="json"))
+    payload = {"debt": debt_account.model_dump(mode="json"), "rollback_id": rollback_id}
+    if json_mode:
+        _out_json(payload)
+    else:
+        click.echo(f"Updated debt: {debt_account.name}")
+        click.echo(f"Rollback ID: {rollback_id}")
+
+
+# ---------------------------------------------------------------------------
 # Reports
 # ---------------------------------------------------------------------------
 
@@ -575,18 +727,28 @@ def report_dashboard(json_mode: bool) -> None:
 @report.command("debt")
 @click.option("--json", "json_mode", is_flag=True)
 @click.option("--extra-monthly", type=str, default="0", help="Extra monthly payment in dollars")
-def report_debt(json_mode: bool, extra_monthly: str) -> None:
+@click.option("--strategy", type=click.Choice(["avalanche", "snowball", "custom"]), default="avalanche")
+def report_debt(json_mode: bool, extra_monthly: str, strategy: str) -> None:
     _require_db()
     from budget.reports import debt_payoff_projection
     from budget.models import to_cents
-    result = debt_payoff_projection(to_cents(extra_monthly))
+    result = debt_payoff_projection(to_cents(extra_monthly), strategy=strategy)
     if json_mode:
         _out_json(result)
     else:
+        click.echo(f"Strategy: {result['strategy']}")
         click.echo(f"Total debt:         ${result['total_debt_cents']/100:.2f}")
         click.echo(f"Min payments:       ${result['min_payments_cents']/100:.2f}")
         click.echo(f"Extra monthly:      ${result['extra_monthly_cents']/100:.2f}")
+        click.echo(f"Monthly budget:     ${result['monthly_payment_budget_cents']/100:.2f}")
         click.echo(f"Est. months to payoff: {result['estimated_months_to_payoff']}")
+        click.echo(f"Debt-free date:     {result['debt_free_date']}")
+        click.echo(f"Est. interest:      ${result['total_interest_cents']/100:.2f}")
+        click.echo(f"Interest saved:     ${result['interest_saved_cents']/100:.2f}")
+        if result["payoff_order"]:
+            click.echo("Payoff order:")
+            for item in result["payoff_order"]:
+                click.echo(f"  {item['name']}: payoff month {item['payoff_month']}")
 
 
 # ---------------------------------------------------------------------------
